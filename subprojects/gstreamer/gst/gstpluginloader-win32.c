@@ -451,74 +451,6 @@ error:
   return FALSE;
 }
 
-static int
-count_directories (const char *filepath)
-{
-  int i = 0;
-  char *tmp;
-  gsize len;
-
-  g_return_val_if_fail (!g_path_is_absolute (filepath), 0);
-
-  tmp = g_strdup (filepath);
-  len = strlen (tmp);
-
-  /* ignore UNC share paths entirely */
-  if (len >= 3 && G_IS_DIR_SEPARATOR (tmp[0]) && G_IS_DIR_SEPARATOR (tmp[1])
-      && !G_IS_DIR_SEPARATOR (tmp[2])) {
-    GST_WARNING ("found a UNC share path, ignoring");
-    return 0;
-  }
-
-  /* remove trailing slashes if they exist */
-  while (
-      /* don't remove the trailing slash for C:\.
-       * UNC paths are at least \\s\s */
-      len > 3 && G_IS_DIR_SEPARATOR (tmp[len - 1])) {
-    tmp[len - 1] = '\0';
-    len--;
-  }
-
-  while (tmp) {
-    char *dirname, *basename;
-    len = strlen (tmp);
-
-    if (g_strcmp0 (tmp, ".") == 0)
-      break;
-    if (g_strcmp0 (tmp, "/") == 0)
-      break;
-
-    /* g_path_get_dirname() may return something of the form 'C:.', where C is
-     * a drive letter */
-    if (len == 3 && g_ascii_isalpha (tmp[0]) && tmp[1] == ':' && tmp[2] == '.')
-      break;
-
-    basename = g_path_get_basename (tmp);
-    dirname = g_path_get_dirname (tmp);
-
-    if (g_strcmp0 (basename, "..") == 0) {
-      i--;
-    } else if (g_strcmp0 (basename, ".") == 0) {
-      /* nothing to do */
-    } else {
-      i++;
-    }
-
-    g_clear_pointer (&basename, g_free);
-    g_clear_pointer (&tmp, g_free);
-    tmp = dirname;
-  }
-
-  g_clear_pointer (&tmp, g_free);
-
-  if (i < 0) {
-    g_critical ("path counting resulted in a negative directory count!");
-    return 0;
-  }
-
-  return i;
-}
-
 static gboolean
 gst_plugin_loader_spawn (GstPluginLoader * loader)
 {
@@ -550,7 +482,7 @@ gst_plugin_loader_spawn (GstPluginLoader * loader)
 
     relocated_libgstreamer = priv_gst_get_relocated_libgstreamer ();
     if (relocated_libgstreamer) {
-      int plugin_subdir_depth = count_directories (GST_PLUGIN_SUBDIR);
+      int plugin_subdir_depth = priv_gst_count_directories (GST_PLUGIN_SUBDIR);
 
       GST_DEBUG ("found libgstreamer-" GST_API_VERSION " library "
           "at %s", relocated_libgstreamer);
@@ -581,6 +513,8 @@ gst_plugin_loader_spawn (GstPluginLoader * loader)
     } else {
       helper_bin = g_strdup (GST_PLUGIN_SCANNER_INSTALLED);
     }
+
+#undef MAX_PATH_DEPTH
 
     GST_DEBUG ("using system plugin scanner at %s", helper_bin);
 
@@ -1276,6 +1210,25 @@ gst_plugin_loader_free (GstPluginLoader * self)
   return got_plugin_detail;
 }
 
+static HANDLE
+gst_plugin_loader_client_create_file (LPCWSTR pipe_name)
+{
+#if (_WIN32_WINNT >= _WIN32_WINNT_WIN8)
+  CREATEFILE2_EXTENDED_PARAMETERS params;
+  memset (&params, 0, sizeof (CREATEFILE2_EXTENDED_PARAMETERS));
+  params.dwSize = sizeof (CREATEFILE2_EXTENDED_PARAMETERS);
+  params.dwFileFlags = FILE_FLAG_OVERLAPPED;
+  params.dwSecurityQosFlags = SECURITY_IMPERSONATION;
+
+  return CreateFile2 (pipe_name,
+      GENERIC_READ | GENERIC_WRITE, 0, OPEN_EXISTING, &params);
+#else
+  return CreateFileW (pipe_name,
+      GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+      FILE_FLAG_OVERLAPPED, NULL);
+#endif
+}
+
 /* child process routine */
 gboolean
 _gst_plugin_loader_client_run (const gchar * pipe_name)
@@ -1284,25 +1237,27 @@ _gst_plugin_loader_client_run (const gchar * pipe_name)
   Win32PluginLoader loader;
   DWORD pipe_mode = PIPE_READMODE_MESSAGE;
   gchar *err = NULL;
+  LPWSTR pipe_name_wide;
+
+  pipe_name_wide = (LPWSTR) g_utf8_to_utf16 (pipe_name, -1, NULL, NULL, NULL);
+  if (!pipe_name_wide) {
+    GST_ERROR ("Couldn't convert %s to wide string", pipe_name);
+    return FALSE;
+  }
 
   win32_plugin_loader_init (&loader, TRUE);
 
   GST_DEBUG ("Connecting pipe %s", pipe_name);
 
   /* Connect to server's named pipe */
-  loader.pipe = CreateFileA (pipe_name,
-      GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
-      FILE_FLAG_OVERLAPPED, NULL);
+  loader.pipe = gst_plugin_loader_client_create_file (pipe_name_wide);
   loader.last_err = GetLastError ();
   if (loader.pipe == INVALID_HANDLE_VALUE) {
     /* Server should be pending (waiting for connection) state already,
      * but do retry if it's not the case */
     if (loader.last_err == ERROR_PIPE_BUSY) {
-      if (WaitNamedPipeA (pipe_name, 5000)) {
-        loader.pipe = CreateFileA (pipe_name,
-            GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED, NULL);
-      }
+      if (WaitNamedPipeW (pipe_name_wide, 5000))
+        loader.pipe = gst_plugin_loader_client_create_file (pipe_name_wide);
 
       loader.last_err = GetLastError ();
     }
@@ -1337,6 +1292,7 @@ _gst_plugin_loader_client_run (const gchar * pipe_name)
 
 out:
   g_free (err);
+  g_free (pipe_name_wide);
   win32_plugin_loader_clear (&loader);
 
   return ret;
