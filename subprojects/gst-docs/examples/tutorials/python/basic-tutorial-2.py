@@ -19,18 +19,23 @@ Gst.init(sys.argv[1:])
 # Create the elements
 source = Gst.ElementFactory.make("videotestsrc", "source")
 sink = Gst.ElementFactory.make("autovideosink", "sink")
+filter1 = Gst.ElementFactory.make("vertigotv", "filter1")
+vc = Gst.ElementFactory.make("videoconvert", "vc")
 
 # Create the empty pipeline
 pipeline = Gst.Pipeline.new("test-pipeline")
 
-if not pipeline or not source or not sink:
+if not pipeline or not source or not sink or not filter1 or not vc:
     logger.error("Not all elements could be created.")
     sys.exit(1)
 
 
 # Build the pipeline
-pipeline.add(source, sink)
-if not source.link(sink):
+pipeline.add(source)
+pipeline.add(filter1)
+pipeline.add(vc)
+pipeline.add(sink)
+if not source.link(filter1) or not filter1.link(vc) or not vc.link(sink):
     logger.error("Elements could not be linked.")
     sys.exit(1)
 
